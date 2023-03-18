@@ -1,0 +1,407 @@
+---
+title: "Single Cell Analysis"
+author: "Michele Rossi | Sabrina Sartori"
+
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    fig_width: 4
+    fig_height: 3
+subtitle: TRANSCRIPTOMICS FINAL PROJECT - PART II 
+editor_options:
+  chunk_output_type: console
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = T,message = T)
+library(rgl)
+options(rgl.useNULL = TRUE)
+```
+
+## TRANSCRIPTOMICS FINAL PROJECT - SINGLE CELL RNA-SEQ ANALYSIS
+
+```{r}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(SeuratData)
+library(remotes)
+library(MySeuratWrappers)
+```
+
+### SAMPLE TYPE  
+Species: Mus Musculus
+Tissue: Lung
+
+
+We load the dataset and, since the gene symbols used as row names have attached the ENSEMBL ID we remove the latter. 
+
+To perform the analysis the data has to be converted in a Seurat object, which will contain the count table and all of the additional information needed.
+Building the Seurat object we set some preliminary filtering. 
+<i>min.cells = 3</i> keeps only genes expressed in at least 3 cells, cutting away genes with 0 counts in nearly all cells.
+<i>min.features = 200</i> instead retains cells that have a signature of expression of at least 200 genes.
+
+```{r}
+load("./SRA837885_SRS4281820.sparse.RData")
+# Fix the gene symbols - remove the ENSEMBL ID
+rownames(sm) <- unlist(lapply(strsplit(rownames(sm), "_"), `[[`, 1))
+
+# Create the Seurat Object 
+Mouse_lung <- CreateSeuratObject(counts = sm, project = "Lung", min.cells = 3, min.features = 200)
+```
+
+We access the information associated to the newly created object - see how the count table is a sparse matrix with dots instead of zeros and how the column names are actually the barcodes associated to each corresponding cell.
+```{r}
+Mouse_lung
+
+sm[10:20, 1:30]
+# sparse matrix, compressed format
+
+# the cell barcodes
+head(colnames(Mouse_lung))
+```
+
+### CELL QUALITY CONTROL
+
+We can compute the percentage of mitochondrial and RNA enconding for ribosomal proteins present in our sample. 
+```{r}
+# list of all genes annotated on the mitochondria
+grep("^mt-",rownames(Mouse_lung@assays$RNA@counts),value = TRUE)
+
+# ribosomal protein genes -> eat up a lot of reads - they are highly expressed
+grep("^Rp[ls]",rownames(Mouse_lung),value = TRUE)
+
+# cell by cell
+# compute the % of reads falling on mt genes
+Mouse_lung[["percent.mt"]] <- PercentageFeatureSet(Mouse_lung, pattern = "^mt-")
+
+# compute the % of reads falling on ribosomal protein genes
+Mouse_lung[["percent.rbp"]] <- PercentageFeatureSet(Mouse_lung, pattern = "^Rp[ls]")
+
+head(Mouse_lung@meta.data, 5)
+```
+
+*nCount_RNA* - column sum - number of reads for each cell after UMI filtering
+*nFeature_RNA* - how many genes are found to be transcribed -  number of unique genes
+
+Plot on which we have to make the choice.
+
+
+nFeatures_RNA is the number of genes found to be transcribed, 
+nCount_RNA is the number of reads for each cell,
+percentage.mt is the percentage of reads falling on mitochondrial genes and 
+percentage.rbp is the percentage of reads falling on ribosomal proteins genes  
+
+
+```{r}
+colors= "#429699"
+VlnPlot(Mouse_lung, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"), cols= colors, ncol = 4, x.lab= "",pt.size=0.001)
+
+
+VlnPlot(Mouse_lung, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"),cols= colors, ncol = 4, x.lab= "", pt.size=0)
+```
+
+It is possible to plot the correlation between the number of reads against percentage of mitochondrial RNA and number of reads against number of genes.
+```{r}
+
+plot1 <- FeatureScatter(Mouse_lung, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = "#5BC6A0", pt.size = 0.001) 
+
+plot2 <- FeatureScatter(Mouse_lung, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", cols = "#2E6D82", pt.size = 0.001) 
+plot1 + plot2
+```
+
+There is no visible correlation between mitochondrial RNA and number of reads, while there is between number of reads against number of genes. The more reads we
+have in a given cell the more genes we find to be transcribed. It is still likely that where the number of genes and reads are very high we are looking at a GEM containing two cells.
+
+A third plot showing the percentage of reads mapped on ribosomal protein coding  genes found against number of reads 
+```{r}
+plot3 <- FeatureScatter(Mouse_lung, feature1 = "nCount_RNA", feature2 = "percent.rbp", cols = "#429699", pt.size = 0.001)
+# reads are not all eaten up by ribosomal protein coding genes
+plot3
+```
+
+Also here there is no remarkable correlation - reads are not all eaten up by ribosomal protein coding genes
+
+### DATASET TRIMMING
+For what we have seen before we keep only cells with a number of genes between 200 and 3000 and with a percentage of reads falling on on mitochondrial genes lower than 5%. 
+```{r}
+Mouse_lung <- subset(Mouse_lung, subset = nFeature_RNA > 200 & nFeature_RNA < 2000 & percent.mt < 5)
+
+Mouse_lung 
+```
+With this trimming we went down from 7503 to 3545 samples. 
+
+
+### NORMALIZING THE DATA
+Normalization strategy used for 10x platform: LogNormalize  
+Scale the original counts in counts per 10k reads, and then compute the log2 of them to make them more human readable. 
+```{r}
+Mouse_lung <- NormalizeData(Mouse_lung, normalization.method = "LogNormalize", scale.factor = 10000)
+
+Mouse_lung@assays$RNA
+#counts
+head(Mouse_lung@assays$RNA@counts, 5)
+#normalized counts
+head(Mouse_lung@assays$RNA@data, 5)
+```
+
+### CELL CYCLE EFFECT
+In Seurat we have pre-computed lists of cell cycle specific genes ,i.e. genes know to be expressed in special phases of cell cycle. 
+```{r}
+cc.genes.updated.2019
+```
+
+According to the expression profiles of these cell cycle genes it is possible to guess in which phase of the cell cycle each cell is. This information is added to the table according to known marker of cell cycle phase, computing the putative cell cycle phase.
+```{r}
+CellCycleScoring(Mouse_lung, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = TRUE) -> Mouse_lung
+
+```
+
+
+The choice is to keep only a subset of the genes - there are too many dimensions for the subsequent analysis -that is, those with the greatest variability of expression across cells.
+We keep only 2000 genes that have the highest variance to perform the downstream analysis.  
+The default method **vst** computes (or better, estimates) the mean-variance relationship for each gene, and chooses the 2000 genes with the highest variance. 
+
+```{r}
+Mouse_lung <- FindVariableFeatures(Mouse_lung, selection.method = "vst", nfeatures = 2000)
+
+#identify the 10 most variable genes
+top10 <- head(VariableFeatures(object = Mouse_lung), 10)
+```
+
+In red we see the 2000 most variable genes.
+```{r}
+plot1 <- VariableFeaturePlot(Mouse_lung)
+
+LabelPoints(plot = plot1, points = top10, repel = TRUE)
+
+```
+
+### SCALING COUNTS
+Scaling is performed on all genes by default. Original counts are scaled in order to have the expression of each gene across the cells shifted with mean 0 and unit variance, so that highly-expressed genes do not dominate.
+```{r}
+all.genes <- rownames(Mouse_lung)
+Mouse_lung <- ScaleData(Mouse_lung, features = all.genes)
+```
+Counts after scaling is a table made of positives (high expression), negatives (under or no expression) and 0s (average expression). 
+
+At this point, we can scale the counts not taking into account the cell cycle effect and the mtRNA - if they are main drivers in similarity between cells, it's better to remove them. 
+
+We want to find out cells that are similar according to the transcriptomic profiles,but the risk is that the cell will be primarily similar because of the cell cycle effect - is not something that is not wanted in every situation
+e.g. samples composed by non proliferating and proliferating cells - the fact that some cells are cycling and others not make the difference in the sample in such case.
+But this is not true in general - for example in our sample
+ 
+If the percentage of mitochondrial genes is not low in virtually all cells, as in our case, it is better to do the count scaling removing their effect. 
+but before this, we have to take a look at the cells: 
+
+### DIMENSIONALITY REDUCTION
+Recommended method for 10x data, and used heavily in all NGS-based assay analysis:
+#### PRINCIPAL COMPONENT ANALYSIS (PCA)  
+The dimensionality reduction is performed on above selected 2000 variable genes:
+
+```{r}
+Mouse_lung <- RunPCA(Mouse_lung, features = VariableFeatures(object = Mouse_lung))
+# the list of most variable genes along the first 5 PCAs
+print(Mouse_lung[["pca"]], dims = 1:5, nfeatures = 5)
+
+ 
+VizDimLoadings(Mouse_lung, dims = 1:2, reduction = "pca", col = "#5BC6A0" , nfeatures = 15)
+VizDimLoadings(Mouse_lung, dims = 3:4, reduction = "pca",ncol = 2, col ="#429699", nfeatures = 15)
+VizDimLoadings(Mouse_lung, dims = 5, reduction = "pca", ncol = 2,  col ="#2E6D82", nfeatures = 15)
+
+# projection of the cells along the first two PCs
+DimPlot(Mouse_lung, reduction = "pca")
+
+```
+Cells are colored according to the guessed cell cycle phase.
+The colors are mixed, so it seems that cells are not grouped by cell cycle, meaning that is not the main source of variability across cells. We don't have to regress out its effect during the counts' scaling phase
+
+### ELBOW PLOT  
+To choose the number of PC on which perform the downstream analysis (clustering):  
+Rule of thumb: sd < 2, reach a plateau
+the more PCs we add, the more noise we insert, less clusters we will have.
+```{r}
+ElbowPlot(Mouse_lung, ndims=30)
+
+# automated way. finds the number of PCs that explain 75% of the variance. 
+pc.touse <- (Mouse_lung$pca@stdev)^2
+pc.touse <- pc.touse/sum(pc.touse)
+pc.touse <- cumsum(pc.touse)[1:50]
+pc.touse <- min(which(pc.touse>=0.75))
+pc.touse
+```
+the automated way chooses as best number of components 22, anyway from the elbow plot we can select 12 as a convenient number of components. 
+ 
+### CLUSTERING  
+I generate the clusters, the core of the single cell RNA-seq analysis
+Method used by Seurat: KNN graph based on the euclidean distance in the PCA space, adjusting the edge weights between two nodes (cells) according to the Jaccard similarity
+The resolution parameter controls the number of clusters. The higher this parameter, the higher the number of clusters. 
+
+We will compare the clustering results performing it starting from two different numbers of PC
+Let's try first setting the number of PC as suggested by the automated way (22 - number of PCs that explain the 75% of the variance)
+```{r}
+Mouse_lung <- FindNeighbors(Mouse_lung, dims = 1:22)
+Mouse_lung <- FindClusters(Mouse_lung, resolution = 0.5)
+# I build a copy for later 
+Mouse_lung_22 <- FindNeighbors(Mouse_lung, dims = 1:22)
+Mouse_lung_22 <- FindClusters(Mouse_lung, resolution = 0.5)
+```
+
+I can see the number of clusters generated and their distribution in the PCA space colored by clusters.
+```{r}
+head(Idents(Mouse_lung), 5)
+
+head(Mouse_lung[[]],5)
+
+DimPlot(Mouse_lung, reduction = "pca")
+```
+
+We can see that the number of clusters generated is 9. 
+From the PCA space cluster we can see how some cells tend to group by color.
+
+We try again with the number of principal components chosen from the elbow plot (12). 
+```{r}
+Mouse_lung <- FindNeighbors(Mouse_lung, dims = 1:12)
+Mouse_lung <- FindClusters(Mouse_lung, resolution = 0.2)
+
+#I build a copy for later 
+Mouse_lung_12 <- FindNeighbors(Mouse_lung, dims = 1:12)
+Mouse_lung_12 <- FindClusters(Mouse_lung, resolution = 0.2)
+DimPlot(Mouse_lung, reduction = "pca")
+
+```
+
+Here the number of clusters generated is 6. Our choice for the number of PC to employ for the downstream analysis is PC = 12
+
+For visualisation purposes, we can use TSNE to generate a plot of our data along the first 12 PCs in 2-dimensions: 
+```{r}
+Mouse_lung <- RunTSNE(Mouse_lung, dims=1:12)
+DimPlot(Mouse_lung, reduction = "tsne")
+
+```
+
+Or UMAP
+```{r}
+
+Mouse_lung <- RunUMAP(Mouse_lung, dims = 1:12)
+DimPlot(Mouse_lung, reduction = "umap")
+```
+
+The UMAP representation is faster and better visualize the data than TSNE one, since it tries to find a low-dimesional representation that preserves relationship between neighbors in high-dimensional space - it has become the method of choice in scRNA-seq analysis for such visualization task
+
+
+Comparing different results with the different number of PCs employed (12 and 22):
+```{r}
+library(ggplot2)
+overlap <- data.frame(cluster_res1 = NA, cluster_res2 = NA, number_cells_common =NA) 
+
+# with PC=12 and resolution=0.2 I obtain clusters from 0 to 6, with PC=22 and resolution=0.5 I obtain clusters from 0 to 6 
+
+for (i in 0:8) { 
+for (j in 0:5) { 
+overlap <- rbind(overlap, c(i,j,length(intersect(rownames(as.data.frame(Idents(Mouse_lung_22)[Idents(Mouse_lung_22) == i])),rownames(as.data.frame(Idents(Mouse_lung_12)[Idents(Mouse_lung_12) == j])))))) 
+} 
+} 
+
+overlap <- overlap[c(-1),] 
+overlap 
+
+# dotplot 
+ggplot(overlap, aes(x= cluster_res1, y= cluster_res2, size=number_cells_common), xlab= "lmao") +
+  xlab("22 PCs, res= 0.5 ")+ ylab("12 PCs, res= 0.2 ") + labs(size = "number\ncommon cells")+ geom_point(colour="#5BC6A0") + 
+theme_classic()  + scale_x_continuous(breaks = 0:8) + scale_y_continuous(breaks = 0:5) 
+
+```
+
+
+It is also possible to check the quality parameters in the different clusters obtained.
+```{r}
+
+VlnPlot(Mouse_lung, features =c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"),  ncol = 2,  x.lab= "", pt.size=0)
+```
+
+I can also compute the percentage of cell cycle phases per cluster.
+```{r}
+library(ggplot2)
+Mouse_lung@meta.data %>%
+  group_by(seurat_clusters,Phase) %>%
+  count() %>%
+  group_by(seurat_clusters) %>%
+  mutate(percent=100*n/sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters,y=percent, fill=Phase)) +
+  geom_col() +
+  ggtitle("Percentage of cell cycle phases per cluster")
+```
+
+### MARKER GENES 
+Finally we search for the marker genes. 
+<i>test.use = "wilcox"</i>: the statistical test used is the Wilcox (non-parametric test) 
+<i>min.pct = 0.25</i>: a gene to be defined as marker has to be expressed by at least 25% of cells in the cluster
+
+For example we can find the markers of cluster 2, when compared against all the others:
+```{r}
+cluster2.markers <- FindMarkers(Mouse_lung, ident.1 = 2, min.pct = 0.25, test.use = "wilcox")
+head(cluster2.markers, n = 5)
+```
+ 
+ 
+Find all the markers genes for all cluster (1 vs all comparison):
+```{r}
+Mouse_lung_markers <- FindAllMarkers(Mouse_lung, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+print.data.frame(Mouse_lung_markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC))
+```
+Markers are sorted by log fold change.  
+this is because this is a non-parametric test, and small values of p-value can correspond to very small differences in numbers  
+so sort by log fold change makes more sense to identify the putative marker genes
+
+
+```{r}
+library(viridis)
+Mouse_lung_markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(Mouse_lung, features = top10$gene) + NoLegend() + scale_fill_viridis()
+
+```
+
+Lets see if dividing the higher cluster number of the 22 components PCA makes sense: 
+```{r}
+
+cluster22_0_1.markers <- FindMarkers(Mouse_lung_22, ident.1 = 0, ident.2 = 1, min.pct = 0.25)
+head(cluster22_0_1.markers, n = 5, order_by = avg_log2FC)
+tail(cluster22_0_1.markers, n = 5, order_by = avg_log2FC)
+
+cluster22_4_5.markers <- FindMarkers(Mouse_lung_22, ident.1 = 4, ident.2 = 5, min.pct = 0.25)
+head(cluster22_4_5.markers, n = 5, order_by = avg_log2FC)
+tail(cluster22_4_5.markers, n = 5, order_by = avg_log2FC)
+
+cluster22_6_7.markers <- FindMarkers(Mouse_lung_22, ident.1 = 6, ident.2 = 7, min.pct = 0.25)
+head(cluster22_6_7.markers, n = 5, order_by = avg_log2FC)
+tail(cluster22_6_7.markers, n = 5, order_by = avg_log2FC)
+```
+
+Since clusters 1 and 4 appear both to be endothelial cells of lung, we can see the genes making the difference between them:
+```{r}
+cluster1_4.markers <- FindMarkers(Mouse_lung, ident.1 = 1, ident.2 = 4, min.pct = 0.25)
+head(cluster1_4.markers, n = 10)
+```
+
+
+Plot of the expression of the identified markers with an heatmap:
+```{r}
+FeaturePlot(Mouse_lung, features = c("Sftpa1", "Cldn5", "Col1a1", "Msln", "Ctla2a", "Spp1"),cols = c("grey", "#429699"))
+
+```
+
+
+```{r}
+new.cluster.ids <- c("Epithelial\ncell","Endothelial\nalveolar cells", "Mesenchimal\ncells", "Mesothelial\ncells", "Endothelial\n cell", "Myocardial\ncontamination")
+names(new.cluster.ids) <- levels(Mouse_lung)
+Mouse_lung <- RenameIdents(Mouse_lung, new.cluster.ids)
+DimPlot(Mouse_lung, reduction = "tsne", label = TRUE, pt.size = 0.5, label.size =5) + NoLegend()
+```
