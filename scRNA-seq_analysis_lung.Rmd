@@ -103,6 +103,7 @@ VlnPlot(Mouse_lung, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","per
 ```
 
 It is possible to plot the correlation between the number of reads against percentage of mitochondrial RNA and number of reads against number of genes.
+
 ```{r}
 
 plot1 <- FeatureScatter(Mouse_lung, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = "#5BC6A0", pt.size = 0.001) 
