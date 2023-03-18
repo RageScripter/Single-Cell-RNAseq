@@ -5,7 +5,7 @@ The data used was collected for the 2019 study ‘Adventitial Stromal Cells Defi
 Aim of the study was understanding the phsysical niche of type 2 lymphocytes.
 
 
-##QUALITY CONTROL
+## QUALITY CONTROL
 We removed cells with:
 - a read count lower than 200 
 - a read count higher 2000 
